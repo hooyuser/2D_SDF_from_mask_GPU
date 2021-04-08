@@ -1,2 +1,2 @@
-# 2D SDF from mask GPU
-Generate 2D SDF from mask bitmap - GPU version with jump flooding algorithm
+# 2D SDF From Mask - GPU Version
+Generate 2D SDF from mask bitmap - A GPU version based on jump flooding algorithm
