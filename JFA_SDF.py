@@ -20,12 +20,12 @@ class SDF2D:
             self.im = cv2.imread(filename)
             self.width, self.height = self.im.shape[1], self.im.shape[0]
             self.pic = ti.Vector.field(3, dtype=ti.i32, shape=(self.width, self.height))
-            self.bit_pic = ti.Vector.field(3, dtype=ti.i32, shape=(2, self.width, self.height))
+            self.bit_pic_white = ti.Vector.field(3, dtype=ti.i32, shape=(2, self.width, self.height))
+            self.bit_pic_black = ti.Vector.field(3, dtype=ti.i32, shape=(2, self.width, self.height))
             self.output_pic = ti.Vector.field(3, dtype=ti.i32, shape=(self.width, self.height))
             self.max_reduction = ti.field(dtype=ti.i32, shape=self.width * self.height)
 
             self.pic.from_numpy(self.im)
-            self.pre_process()
 
     def output_filename(self):
         path = pathlib.Path(self.filename)
@@ -35,45 +35,45 @@ class SDF2D:
         return str(out_dir / (path.stem + '_sdf' + path.suffix))
 
     @ti.kernel
-    def pre_process(self):
+    def pre_process(self, bit_pic: ti.template(), keep_white: ti.i32):  # keep_white, 1 == True, -1 == False
         for i, j in self.pic:
-            if self.pic[i, j][0] > 128:
-                self.bit_pic[0, i, j] = ti.Vector([i, j, 0])
-                self.bit_pic[1, i, j] = ti.Vector([i, j, 0])
+            if (self.pic[i, j][0] - 127) * keep_white > 0:
+                bit_pic[0, i, j] = ti.Vector([i, j, 0])
+                bit_pic[1, i, j] = ti.Vector([i, j, 0])
             else:
-                self.bit_pic[0, i, j] = null
-                self.bit_pic[1, i, j] = null
+                bit_pic[0, i, j] = null
+                bit_pic[1, i, j] = null
 
     @ti.func
     def cal_dist_sqr(self, p1_x, p1_y, p2_x, p2_y):
         return (p1_x - p2_x) ** 2 + (p1_y - p2_y) ** 2
 
     @ti.kernel
-    def jump_flooding(self, stride: ti.i32, n: ti.i32):
+    def jump_flooding(self, bit_pic: ti.template(), stride: ti.i32, n: ti.i32):
         # print('n =', n, '\n')
         for i, j in ti.ndrange(self.width, self.height):
             for di, dj in ti.ndrange((-1, 2), (-1, 2)):
                 i_off = i + stride * di
                 j_off = j + stride * dj
                 if 0 <= i_off < self.width and 0 <= j_off < self.height:
-                    dist_sqr = self.cal_dist_sqr(i, j, self.bit_pic[n, i_off, j_off][0],
-                                                 self.bit_pic[n, i_off, j_off][1])
+                    dist_sqr = self.cal_dist_sqr(i, j, bit_pic[n, i_off, j_off][0],
+                                                 bit_pic[n, i_off, j_off][1])
                     # print(i, ', ', j, ': ', 'dist_sqr: ', dist_sqr,', ', i_off, j_off)
-                    if not self.bit_pic[n, i_off, j_off][0] < 0 and dist_sqr < self.bit_pic[1 - n, i, j][2]:
-                        self.bit_pic[1 - n, i, j][0] = self.bit_pic[n, i_off, j_off][0]
-                        self.bit_pic[1 - n, i, j][1] = self.bit_pic[n, i_off, j_off][1]
-                        self.bit_pic[1 - n, i, j][2] = dist_sqr
+                    if not bit_pic[n, i_off, j_off][0] < 0 and dist_sqr < bit_pic[1 - n, i, j][2]:
+                        bit_pic[1 - n, i, j][0] = bit_pic[n, i_off, j_off][0]
+                        bit_pic[1 - n, i, j][1] = bit_pic[n, i_off, j_off][1]
+                        bit_pic[1 - n, i, j][2] = dist_sqr
                         # print(i, ', ', j, ': ', 'dist_sqr: ', dist_sqr, ', ', i_off, j_off)
 
     @ti.kernel
-    def post_process(self, n: ti.i32):
+    def post_process(self, bit_pic: ti.template(), n: ti.i32, coff: ti.f32, offset: ti.f32):
         for i, j in self.output_pic:
-            self.output_pic[i, j] = vec3(ti.cast(ti.sqrt(self.bit_pic[n, i, j][2]) / self.max_dist, ti.u32))
+            self.output_pic[i, j] = vec3(ti.cast(ti.sqrt(bit_pic[n, i, j][2]) * coff + offset, ti.u32))
 
     @ti.kernel
-    def copy(self):
+    def copy(self, bit_pic: ti.template()):
         for i, j in ti.ndrange(self.width, self.height):
-            self.max_reduction[i * self.width + j] = self.bit_pic[self.num, i, j][2]
+            self.max_reduction[i * self.width + j] = bit_pic[self.num, i, j][2]
 
     @ti.kernel
     def max_reduction_kernel(self, r_stride: ti.i32):
@@ -88,32 +88,49 @@ class SDF2D:
     #               self.bit_pic[n, i, j][2])
     #     print('\n')
 
-    def mask2udf(self, normalized=True, output=False):  # unsigned distance
+    def gen_udf(self, dist_buffer):
+        self.pre_process(dist_buffer, 1)
         stride = self.width >> 1
         while stride > 0:
-            self.jump_flooding(stride, self.num)
+            self.jump_flooding(dist_buffer, stride, self.num)
             stride >>= 1
             self.num = 1 - self.num
 
-        # self.jump_flooding(2, self.num)
+        # self.jump_flooding(self.bit_pic_white, 2, self.num)
         # self.num = 1 - self.num
 
-        self.jump_flooding(1, self.num)
+        self.jump_flooding(dist_buffer, 1, self.num)
         self.num = 1 - self.num
 
-        self.copy()
+    def find_max(self, dist_buffer):
+        self.copy(dist_buffer)
 
         r_stride = self.width * self.height >> 1
         while r_stride > 0:
             self.max_reduction_kernel(r_stride)
             r_stride >>= 1
 
-        self.max_dist = ti.sqrt(self.max_reduction[0]) / 255.0
+        return self.max_reduction[0]
 
-        self.post_process(self.num)
+    def mask2udf(self, normalized=(0, 1), to_rgb=True, output=False):  # unsigned distance
+        self.gen_udf(self.bit_pic_white)
+
+        largest_dist = self.find_max(self.bit_pic_white)
+
+        if to_rgb:
+            coefficient = 255.0 / ti.sqrt(largest_dist)
+            offset = 0.0
+        else:
+            coefficient = (normalized[1] - normalized[0]) / ti.sqrt(largest_dist)
+            offset = normalized[0]
 
         if output:
-            cv2.imwrite(self.out_filename, self.output_pic.to_numpy())
+            self.post_process(self.bit_pic_white, self.num, coefficient, offset)
+            if to_rgb:
+                cv2.imwrite(self.out_filename, self.output_pic.to_numpy())
+
+    def mask2sdf(self, normalized=(0, 1), to_rgb=True, output=False):
+        pass
 
 
 filename = r"test_file/test_2048.png"
