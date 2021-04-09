@@ -12,7 +12,6 @@ class SDF2D:
     def __init__(self, filename, multiple_files=False):
         ti.init(arch=ti.gpu, kernel_profiler=True, debug=False, print_ir=False)
         self.filename = filename
-        self.out_filename = self.output_filename()
         self.multiple_files = multiple_files
         if not multiple_files:
             self.num = 0  # index of bit_pic
@@ -27,12 +26,12 @@ class SDF2D:
 
             self.pic.from_numpy(self.im)
 
-    def output_filename(self):
+    def output_filename(self, ins):
         path = pathlib.Path(self.filename)
         out_dir = path.parent / 'output'
         if not (out_dir.exists() and out_dir.is_dir()):
             out_dir.mkdir()
-        return str(out_dir / (path.stem + '_sdf' + path.suffix))
+        return str(out_dir / (path.stem + ins + path.suffix))
 
     @ti.kernel
     def pre_process(self, bit_pic: ti.template(), keep_white: ti.i32):  # keep_white, 1 == True, -1 == False
@@ -66,11 +65,6 @@ class SDF2D:
                         # print(i, ', ', j, ': ', 'dist_sqr: ', dist_sqr, ', ', i_off, j_off)
 
     @ti.kernel
-    def post_process(self, bit_pic: ti.template(), n: ti.i32, coff: ti.f32, offset: ti.f32):
-        for i, j in self.output_pic:
-            self.output_pic[i, j] = vec3(ti.cast(ti.sqrt(bit_pic[n, i, j][2]) * coff + offset, ti.u32))
-
-    @ti.kernel
     def copy(self, bit_pic: ti.template()):
         for i, j in ti.ndrange(self.width, self.height):
             self.max_reduction[i * self.width + j] = bit_pic[self.num, i, j][2]
@@ -80,6 +74,18 @@ class SDF2D:
         for i in range(r_stride):
             self.max_reduction[i] = max(self.max_reduction[i], self.max_reduction[i + r_stride])
 
+    @ti.kernel
+    def post_process_udf(self, bit_pic: ti.template(), n: ti.i32, coff: ti.f32, offset: ti.f32):
+        for i, j in self.output_pic:
+            self.output_pic[i, j] = vec3(ti.cast(ti.sqrt(bit_pic[n, i, j][2]) * coff + offset, ti.u32))
+
+    @ti.kernel
+    def post_process_sdf(self, bit_pic_w: ti.template(), bit_pic_b: ti.template(), n: ti.i32, coff: ti.f32,
+                         offset: ti.f32):
+        for i, j in self.output_pic:
+            self.output_pic[i, j] = vec3(
+                ti.cast((ti.sqrt(bit_pic_w[n, i, j][2]) - ti.sqrt(bit_pic_b[n, i, j][2])) * coff + offset, ti.u32))
+
     # @ti.kernel
     # def print_p(self, n: ti.i32):
     #     print(n, '\n')
@@ -88,8 +94,10 @@ class SDF2D:
     #               self.bit_pic[n, i, j][2])
     #     print('\n')
 
-    def gen_udf(self, dist_buffer):
-        self.pre_process(dist_buffer, 1)
+    def gen_udf(self, dist_buffer, keep_white=True):
+        keep_white_para = 1 if keep_white else -1
+        self.pre_process(dist_buffer, keep_white_para)
+        self.num = 0
         stride = self.width >> 1
         while stride > 0:
             self.jump_flooding(dist_buffer, stride, self.num)
@@ -112,30 +120,45 @@ class SDF2D:
 
         return self.max_reduction[0]
 
-    def mask2udf(self, normalized=(0, 1), to_rgb=True, output=False):  # unsigned distance
+    def mask2udf(self, normalized=(0, 1), to_rgb=True, output=True):  # unsigned distance
         self.gen_udf(self.bit_pic_white)
 
-        largest_dist = self.find_max(self.bit_pic_white)
+        max_dist = ti.sqrt(self.find_max(self.bit_pic_white))
 
         if to_rgb:
-            coefficient = 255.0 / ti.sqrt(largest_dist)
+            coefficient = 255.0 / max_dist
             offset = 0.0
         else:
-            coefficient = (normalized[1] - normalized[0]) / ti.sqrt(largest_dist)
+            coefficient = (normalized[1] - normalized[0]) / max_dist
             offset = normalized[0]
 
         if output:
-            self.post_process(self.bit_pic_white, self.num, coefficient, offset)
+            self.post_process_udf(self.bit_pic_white, self.num, coefficient, offset)
             if to_rgb:
-                cv2.imwrite(self.out_filename, self.output_pic.to_numpy())
+                cv2.imwrite(self.output_filename('_udf'), self.output_pic.to_numpy())
 
-    def mask2sdf(self, normalized=(0, 1), to_rgb=True, output=False):
-        pass
+    def mask2sdf(self, to_rgb=True, output=True):  # grey value equals 0.5 means sdf == 0
+        self.gen_udf(self.bit_pic_white, keep_white=True)
+        max_positive_dist = ti.sqrt(self.find_max(self.bit_pic_white))
+        self.gen_udf(self.bit_pic_black, keep_white=False)
+        min_negative_dist = ti.sqrt(self.find_max(self.bit_pic_black))  # this value is positive
+
+        if to_rgb:
+            coefficient = 127.5 / max(max_positive_dist, min_negative_dist)
+            offset = 127.5
+        else:  # no normalization
+            coefficient = 1.0
+            offset = 0.0
+
+        if output:
+            self.post_process_sdf(self.bit_pic_white, self.bit_pic_black, self.num, coefficient, offset)
+            if to_rgb:
+                cv2.imwrite(self.output_filename('_sdf'), self.output_pic.to_numpy())
 
 
-filename = r"test_file/test_2048.png"
+filename = r"test_file/test_1024_2.png"
 
 mySDF2D = SDF2D(filename)
-mySDF2D.mask2udf(output=True)
+mySDF2D.mask2sdf()
 
 ti.kernel_profiler_print()
