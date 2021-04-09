@@ -2,6 +2,8 @@ import cv2
 import taichi as ti
 import pathlib
 
+ti.init(arch=ti.gpu, kernel_profiler=True, debug=True, print_ir=False)
+
 MAX_DIST = 2147483647
 null = ti.Vector([-1, -1, MAX_DIST])
 vec3 = lambda scalar: ti.Vector([scalar, scalar, scalar])
@@ -9,22 +11,18 @@ vec3 = lambda scalar: ti.Vector([scalar, scalar, scalar])
 
 @ti.data_oriented
 class SDF2D:
-    def __init__(self, filename, multiple_files=False):
-        ti.init(arch=ti.gpu, kernel_profiler=True, debug=False, print_ir=False)
+    def __init__(self, filename):
         self.filename = filename
-        self.multiple_files = multiple_files
-        if not multiple_files:
-            self.num = 0  # index of bit_pic
+        self.num = 0  # index of bit_pic
 
-            self.im = cv2.imread(filename)
-            self.width, self.height = self.im.shape[1], self.im.shape[0]
-            self.pic = ti.Vector.field(3, dtype=ti.i32, shape=(self.width, self.height))
-            self.bit_pic_white = ti.Vector.field(3, dtype=ti.i32, shape=(2, self.width, self.height))
-            self.bit_pic_black = ti.Vector.field(3, dtype=ti.i32, shape=(2, self.width, self.height))
-            self.output_pic = ti.Vector.field(3, dtype=ti.i32, shape=(self.width, self.height))
-            self.max_reduction = ti.field(dtype=ti.i32, shape=self.width * self.height)
-
-            self.pic.from_numpy(self.im)
+        self.im = cv2.imread(filename)
+        self.width, self.height = self.im.shape[1], self.im.shape[0]
+        self.pic = ti.Vector.field(3, dtype=ti.i32, shape=(self.width, self.height))
+        self.bit_pic_white = ti.Vector.field(3, dtype=ti.i32, shape=(2, self.width, self.height))
+        self.bit_pic_black = ti.Vector.field(3, dtype=ti.i32, shape=(2, self.width, self.height))
+        self.output_pic = ti.Vector.field(3, dtype=ti.i32, shape=(self.width, self.height))
+        self.output_linear = ti.Vector.field(3, dtype=ti.f32, shape=(self.width, self.height))
+        self.max_reduction = ti.field(dtype=ti.i32, shape=self.width * self.height)
 
     def output_filename(self, ins):
         path = pathlib.Path(self.filename)
@@ -86,6 +84,11 @@ class SDF2D:
             self.output_pic[i, j] = vec3(
                 ti.cast((ti.sqrt(bit_pic_w[n, i, j][2]) - ti.sqrt(bit_pic_b[n, i, j][2])) * coff + offset, ti.u32))
 
+    @ti.kernel
+    def post_process_sdf_linear_1channel(self, bit_pic_w: ti.template(), bit_pic_b: ti.template(), n: ti.i32):
+        for i, j in self.output_pic:
+            self.output_linear[i, j][0] = ti.sqrt(bit_pic_w[n, i, j][2]) - ti.sqrt(bit_pic_b[n, i, j][2])
+
     # @ti.kernel
     # def print_p(self, n: ti.i32):
     #     print(n, '\n')
@@ -95,6 +98,7 @@ class SDF2D:
     #     print('\n')
 
     def gen_udf(self, dist_buffer, keep_white=True):
+        self.pic.from_numpy(self.im)
         keep_white_para = 1 if keep_white else -1
         self.pre_process(dist_buffer, keep_white_para)
         self.num = 0
@@ -125,40 +129,92 @@ class SDF2D:
 
         max_dist = ti.sqrt(self.find_max(self.bit_pic_white))
 
-        if to_rgb:
+        if to_rgb:  # scale sdf proportionally to [0, 1]
             coefficient = 255.0 / max_dist
             offset = 0.0
         else:
             coefficient = (normalized[1] - normalized[0]) / max_dist
             offset = normalized[0]
 
+        self.post_process_udf(self.bit_pic_white, self.num, coefficient, offset)
         if output:
-            self.post_process_udf(self.bit_pic_white, self.num, coefficient, offset)
             if to_rgb:
                 cv2.imwrite(self.output_filename('_udf'), self.output_pic.to_numpy())
 
-    def mask2sdf(self, to_rgb=True, output=True):  # grey value equals 0.5 means sdf == 0
+    def mask2sdf(self, to_rgb=True, output=True):
         self.gen_udf(self.bit_pic_white, keep_white=True)
-        max_positive_dist = ti.sqrt(self.find_max(self.bit_pic_white))
         self.gen_udf(self.bit_pic_black, keep_white=False)
-        min_negative_dist = ti.sqrt(self.find_max(self.bit_pic_black))  # this value is positive
 
-        if to_rgb:
+        if to_rgb:  # grey value == 0.5 means sdf == 0, scale sdf proportionally
+            max_positive_dist = ti.sqrt(self.find_max(self.bit_pic_white))
+            min_negative_dist = ti.sqrt(self.find_max(self.bit_pic_black))  # this value is positive
             coefficient = 127.5 / max(max_positive_dist, min_negative_dist)
             offset = 127.5
-        else:  # no normalization
-            coefficient = 1.0
-            offset = 0.0
-
-        if output:
             self.post_process_sdf(self.bit_pic_white, self.bit_pic_black, self.num, coefficient, offset)
-            if to_rgb:
+            if output:
                 cv2.imwrite(self.output_filename('_sdf'), self.output_pic.to_numpy())
+        else:  # no normalization
+            if output:
+                pass
+            else:
+                self.post_process_sdf_linear_1channel(self.bit_pic_white, self.bit_pic_black, self.num)
 
 
-filename = r"test_file/test_1024_2.png"
+@ti.data_oriented
+class MultiSDF2D:
+    def __init__(self, file_name, file_num, sample_num=256):
+        self.file_name = file_name
+        self.file_path = pathlib.Path(file_name)
+        self.file_num = file_num
+        self.sample_num = sample_num
+        self.name_base = self.file_path.stem[:-2]
+        self.sdf_list = self.gen_sdf_list()
+        self.width, self.height = self.sdf_list[0].width, self.sdf_list[0].height
+        self.output_pic = ti.Vector.field(3, dtype=ti.i32, shape=(self.width, self.height))
 
-mySDF2D = SDF2D(filename)
-mySDF2D.mask2sdf()
+    def output_filename(self, ins='output'):
+        out_dir = self.file_path.parent / 'output'
+        if not (out_dir.exists() and out_dir.is_dir()):
+            out_dir.mkdir()
+        return str(out_dir / (self.name_base + ins + self.file_path.suffix))
+
+    def gen_sdf_list(self):
+        lst = []
+        for i in range(self.file_num):
+            name = str(self.file_path.parent / f'{self.name_base}_{i + 1}{self.file_path.suffix}')
+            lst.append(SDF2D(name))
+        return lst
+
+    def blur_mix_sdf(self):
+        for sdf in self.sdf_list:
+            sdf.mask2sdf(to_rgb=False, output=False)
+        self.blur_mix(self.sdf_list[0].output_linear, self.sdf_list[1].output_linear)
+        cv2.imwrite(self.output_filename('_blur_mix'), self.output_pic.to_numpy())
+
+    @ti.kernel
+    def blur_mix(self, sdf1: ti.template(), sdf2: ti.template()):
+        for i, j in self.output_pic:
+            dis1 = sdf1[i, j][0]
+            dis2 = sdf2[i, j][0]
+            if dis1 < 0.4999 and dis2 < 0.4999:
+                self.output_pic[i, j] = vec3(255)
+            elif dis1 > 0.5 and dis2 > 0.5:
+                self.output_pic[i, j] = vec3(0)
+            else:
+                res = -1
+                for n in range(self.sample_num):
+                    mix = n / self.sample_num
+                    if (1 - mix) * dis1 + mix * dis2 < 0.4999:
+                        res += 256
+                self.output_pic[i, j] = vec3(res // self.sample_num)
+
+
+img_name = r"test_file/test_1024_1.png"
+
+# mySDF2D = SDF2D(img_name)
+# mySDF2D.mask2sdf()
+
+myMultiSDF2D = MultiSDF2D(img_name, 2)
+myMultiSDF2D.blur_mix_sdf()
 
 ti.kernel_profiler_print()
